@@ -516,7 +516,16 @@ class DB:
             now = _now()
             rec.update(created_at=now, created_by=user, edited_at=now, edited_by=user, status="Active")
             _append(wb["Items"], rec)
+            existing_serials = {_norm(r.get("code")) for r in _lot_rows(wb)
+                                if _norm(r.get("item_number")) == _norm(num) and (r.get("tracking_type") or "").upper() == "SN" and r.get("code")}
             for lot in lots:
+                if (lot.get("tracking_type") or "").upper() == "SN":
+                    code = str(lot.get("code") or "").strip()
+                    if not re.fullmatch(r"\d{3}", code):
+                        raise ValueError(f"Serial number '{code}' must be numeric and three digits (001-999).")
+                    if _norm(code) in existing_serials:
+                        raise ValueError(f"Serial number '{code}' already exists for {num}.")
+                    existing_serials.add(_norm(code))
                 wb["Lots"].append([num, lot.get("code"), lot["quantity"], lot.get("uom") or rec["uom"], lot["location"], now,
                                    lot.get("tracking_type") or rec.get("tracking") or "NONE", "active", user])
             _recalc_item_totals(wb)
@@ -670,6 +679,42 @@ def make_lots(qty, uom, count_text, tracking="LOT", today=None):
     else:
         shares = [round(qty / n, 6)] * n
     return list(zip(codes, shares))
+
+
+def _split_serial_tokens(text):
+    return [tok for tok in re.split(r"[\s,;]+", str(text or "").strip()) if tok]
+
+
+def next_lot_code(existing_codes, today=None):
+    today = today or dt.date.today()
+    base = f"{today:%y}{today.timetuple().tm_yday:03d}"
+    used = set()
+    for code in existing_codes:
+        c = str(code or "").strip()
+        m = re.fullmatch(rf"{re.escape(base)}(?:-(\d+))?", c)
+        if not m:
+            continue
+        used.add(int(m.group(1)) if m.group(1) else 0)
+    if 0 not in used:
+        return base
+    n = 1
+    while n in used:
+        n += 1
+    return f"{base}-{n}"
+
+
+def next_serial_codes(existing_codes, count):
+    used = {_norm(c) for c in existing_codes if str(c or "").strip()}
+    out = []
+    for i in range(1, 1000):
+        code = f"{i:03d}"
+        if _norm(code) in used:
+            continue
+        out.append(code)
+        used.add(_norm(code))
+        if len(out) == count:
+            return out
+    raise ValueError("Not enough available serial numbers in 001-999.")
 
 
 # --------------------------------------------------------------------- UI
@@ -1506,10 +1551,9 @@ class ProductCard(tk.Frame):
         self.app, self.item, self.mode = app, item, mode
         lookups = app.guarded(app.db.lookups)
         self.uoms, self.locs = lookups if lookups else (DEFAULT_UOMS, ["Virtual Intake"])
-        v = self.v = {k: tk.StringVar() for k in ("name", "cat", "num", "qty", "uom", "loc", "mfr", "gen_n", "min", "sub", "rev", "dash", "link")}
-        self.override, self.gen, self.low = tk.BooleanVar(), tk.BooleanVar(), tk.BooleanVar()
+        v = self.v = {k: tk.StringVar() for k in ("name", "cat", "num", "qty", "uom", "mfr", "min", "sub", "rev", "dash", "link")}
+        self.override, self.low = tk.BooleanVar(), tk.BooleanVar()
         self.track = tk.StringVar(value="NONE")
-        v["gen_n"].set("ALL")
         v["uom"].set(self.uoms[0])
         hdr = tk.Frame(self, bg=PANEL)
         hdr.grid(sticky="ew", columnspan=2)
@@ -1600,8 +1644,6 @@ class ProductCard(tk.Frame):
         mk_entry(r, v["qty"], width=12).pack(side="left", ipady=6)
         ttk.Combobox(r, textvariable=v["uom"], values=self.uoms, font=FONT).pack(side="left", fill="x", expand=True, padx=(8, 0))
         tk.Label(fr, text="Type a new unit in the box to add one.", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        fr, self.loc_lbl = cell(3, 1, "Location")
-        ttk.Combobox(fr, textvariable=v["loc"], values=self.locs, state="readonly", font=FONT).pack(fill="x", pady=(4, 0))
         fr, _ = cell(4, 0, "Manufacturer")
         self.w_mfr = mk_entry(fr, v["mfr"])
         self.w_mfr.pack(fill="x", ipady=6, pady=(4, 0))
@@ -1621,18 +1663,15 @@ class ProductCard(tk.Frame):
                                 command=self.sync_tracking)
             rb.pack(side="left", padx=(0, 12))
             self.radios.append(rb)
-        tk.Label(r, text="Generate", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(8, 6))
-        self.gen_t = Toggle(r, self.gen, self.sync_tracking)
-        self.gen_t.pack(side="left")
-        self.gen_n = ttk.Combobox(r, textvariable=v["gen_n"], values=["ALL"], width=6, font=FONT)
         afr, _ = cell(5, 0, "Initial allocations", span=2)
         self.alloc_wrap = tk.Frame(afr, bg=PANEL2, highlightthickness=1, highlightbackground=BORDER, padx=8, pady=8)
         self.alloc_wrap.pack(fill="x", pady=(4, 0))
         self.alloc_rows = []
         h = tk.Frame(self.alloc_wrap, bg=PANEL2)
         h.pack(fill="x")
-        for txt, w in (("Location", 28), ("Qty", 10), ("Code (LOT/SN)", 18)):
+        for txt, w in (("Location", 24), ("Qty", 10), ("Code", 30)):
             tk.Label(h, text=txt, bg=PANEL2, fg=MUTED, font=("Segoe UI", 9, "bold"), width=w, anchor="w").pack(side="left", padx=(0, 8))
+        self.alloc_code_lbl = h.winfo_children()[2]
         tk.Button(h, text="+ Add", relief="flat", bd=0, bg=PANEL2, fg=FOCUS, cursor="hand2",
                   command=self.add_alloc_row).pack(side="right")
         self.alloc_body = tk.Frame(self.alloc_wrap, bg=PANEL2)
@@ -1734,7 +1773,6 @@ class ProductCard(tk.Frame):
         v["uom"].set(it["uom"] or "")
         if it["quantity"] is not None:
             v["qty"].set(f"{it['quantity']:g}")
-        v["loc"].set(it["location"] or "")
         v["mfr"].set(it["manufacturer"] or "")
         self.notes.insert("1.0", it["notes"] or "")
         self.track.set(it["tracking"] or "NONE")
@@ -2012,23 +2050,33 @@ class ProductCard(tk.Frame):
 
     def sync_qty(self):
         has = bool(self.v["qty"].get().strip())
-        self.loc_lbl.config(text="Location" + (" *" if has else ""))
-        if not has:
-            self.gen.set(False)
+        if self.mode == "create":
+            if has:
+                if not self.alloc_wrap.winfo_ismapped():
+                    self.alloc_wrap.pack(fill="x", pady=(4, 0))
+            else:
+                self.alloc_wrap.pack_forget()
         self.sync_tracking()
 
     def sync_tracking(self):
-        can = self.mode == "create" and self.track.get() in ("LOT", "SN") and bool(self.v["qty"].get().strip())
-        if not can:
-            self.gen.set(False)
-        self.gen_t.set_enabled(can)
-        if self.gen.get():
-            self.gen_n.pack(side="left", padx=(10, 0))
-        else:
-            self.gen_n.pack_forget()
+        tracking = self.track.get()
+        has_qty = bool(self.v["qty"].get().strip())
+        can_code = self.mode == "create" and has_qty and tracking in ("LOT", "SN")
+        self.alloc_code_lbl.config(text="LOT code" if tracking == "LOT" else ("Serial number(s)" if tracking == "SN" else "Code"))
         for row in self.alloc_rows:
-            state = "normal" if self.track.get() in ("LOT", "SN") else "disabled"
+            state = "normal" if can_code else "disabled"
             row["code_w"].config(state=state)
+            row["gen_w"].config(state="normal" if can_code else "disabled")
+            if can_code:
+                if not row["code_w"].winfo_manager():
+                    row["code_w"].pack(side="left", padx=(0, 8), ipady=3, before=row["gen_w"])
+                if not row["gen_w"].winfo_manager():
+                    row["gen_w"].pack(side="left", padx=(0, 8), before=row["rm_w"])
+            else:
+                if row["code_w"].winfo_manager():
+                    row["code_w"].pack_forget()
+                if row["gen_w"].winfo_manager():
+                    row["gen_w"].pack_forget()
 
     def sync_low(self):
         if self.low.get():
@@ -2044,15 +2092,21 @@ class ProductCard(tk.Frame):
         loc = tk.StringVar()
         qty = tk.StringVar()
         code = tk.StringVar()
-        lw = ttk.Combobox(row, textvariable=loc, values=self.locs, state="readonly", width=28, font=("Segoe UI", 10))
+        lw = ttk.Combobox(row, textvariable=loc, values=self.locs, state="readonly", width=24, font=("Segoe UI", 10))
         lw.pack(side="left", padx=(0, 8))
         qw = mk_entry(row, qty, width=10)
         qw.pack(side="left", padx=(0, 8), ipady=3)
-        cw = mk_entry(row, code, width=18)
+        cw = mk_entry(row, code, width=30)
         cw.pack(side="left", padx=(0, 8), ipady=3)
-        tk.Button(row, text="−", relief="flat", bd=0, bg=PANEL2, fg=ERR, cursor="hand2",
-                  command=lambda fr=row: self.remove_alloc_row(fr)).pack(side="left")
-        self.alloc_rows.append({"frame": row, "loc": loc, "qty": qty, "code": code, "code_w": cw})
+        gw = tk.Button(row, text="Generate", relief="flat", bd=0, bg=PANEL2, fg=FOCUS, cursor="hand2",
+                       command=lambda d=None: self.generate_alloc_code(d))
+        gw.pack(side="left", padx=(0, 8))
+        rw = tk.Button(row, text="−", relief="flat", bd=0, bg=PANEL2, fg=ERR, cursor="hand2",
+                       command=lambda fr=row: self.remove_alloc_row(fr))
+        rw.pack(side="left")
+        d = {"frame": row, "loc": loc, "qty": qty, "code": code, "code_w": cw, "gen_w": gw, "rm_w": rw}
+        gw.config(command=lambda data=d: self.generate_alloc_code(data))
+        self.alloc_rows.append(d)
         self.sync_tracking()
 
     def remove_alloc_row(self, frame):
@@ -2064,9 +2118,48 @@ class ProductCard(tk.Frame):
         self.alloc_rows = [r for r in self.alloc_rows if r["frame"] is not frame]
         frame.destroy()
 
+    def generate_alloc_code(self, row):
+        tracking = self.track.get()
+        if tracking not in ("LOT", "SN"):
+            return
+        if not self.v["qty"].get().strip():
+            self.err.config(text="Enter the product quantity before generating codes.")
+            return
+        qtxt = row["qty"].get().strip()
+        try:
+            qty = float(qtxt)
+        except ValueError:
+            self.err.config(text="Allocation row quantity must be numeric before generation.")
+            return
+        if qty <= 0:
+            self.err.config(text="Allocation row quantity must be greater than zero.")
+            return
+        try:
+            if tracking == "LOT":
+                existing = [r["code"].get().strip() for r in self.alloc_rows if r is not row]
+                row["code"].set(next_lot_code(existing))
+            else:
+                others = []
+                for r in self.alloc_rows:
+                    if r is row:
+                        continue
+                    others.extend(_split_serial_tokens(r["code"].get()))
+                if _norm(self.v["uom"].get()) in DISCRETE_UOMS:
+                    if qty != int(qty):
+                        raise ValueError("SN generation for Unit/Vials requires a whole-number quantity.")
+                    count = int(qty)
+                else:
+                    count = 1
+                row["code"].set(", ".join(next_serial_codes(others, count)))
+        except ValueError as e:
+            self.err.config(text=str(e))
+            return
+        self.err.config(text="")
+
     def parse_allocations(self, total_qty, uom):
         tracking = self.track.get()
         rows, serials = [], set()
+        discrete = _norm(uom) in DISCRETE_UOMS
         for r in self.alloc_rows:
             loc = r["loc"].get().strip()
             qtxt = r["qty"].get().strip()
@@ -2082,46 +2175,36 @@ class ProductCard(tk.Frame):
             if q <= 0:
                 raise ValueError("Allocation row quantity must be greater than zero.")
             if tracking == "SN":
-                if q != 1:
-                    raise ValueError("SN allocation rows must have quantity 1.")
-                if not code:
-                    raise ValueError("SN allocations require a serial number.")
-                if _norm(code) in serials:
-                    raise ValueError(f"Duplicate serial number '{code}'.")
-                serials.add(_norm(code))
+                codes = _split_serial_tokens(code)
+                if discrete:
+                    if q != int(q):
+                        raise ValueError("SN allocations for Unit/Vials require whole-number quantities.")
+                    need = int(q)
+                else:
+                    need = 1
+                if len(codes) != need:
+                    raise ValueError(f"SN allocation requires exactly {need} serial number(s) for quantity {q:g}.")
+                for sn in codes:
+                    if not re.fullmatch(r"\d{3}", sn):
+                        raise ValueError(f"Serial number '{sn}' must be numeric and three digits (001-999).")
+                    if _norm(sn) in serials:
+                        raise ValueError(f"Duplicate serial number '{sn}'.")
+                    serials.add(_norm(sn))
+                if discrete:
+                    rows.extend({"location": loc, "quantity": 1.0, "code": sn, "uom": uom, "tracking_type": tracking}
+                                for sn in codes)
+                else:
+                    rows.append({"location": loc, "quantity": q, "code": codes[0], "uom": uom, "tracking_type": tracking})
             elif tracking == "LOT" and not code:
                 raise ValueError("LOT allocations require a lot code.")
-            elif tracking == "NONE":
-                code = ""
-            rows.append({"location": loc, "quantity": q, "code": code or None, "uom": uom, "tracking_type": tracking})
+            else:
+                rows.append({"location": loc, "quantity": q, "code": None if tracking == "NONE" else (code or None), "uom": uom,
+                             "tracking_type": "NONE" if tracking == "NONE" else tracking})
+        if total_qty > 0 and not rows:
+            raise ValueError("Allocation rows are required when quantity is entered.")
         allocated = round(sum(r["quantity"] for r in rows), 6)
-        if allocated > total_qty + 1e-9:
-            raise ValueError("Allocated quantity cannot exceed entered quantity.")
-        remaining = round(total_qty - allocated, 6)
-        if remaining > 1e-9:
-            default_loc = self.v["loc"].get().strip()
-            if not default_loc:
-                raise ValueError("Location is required for unallocated quantity.")
-            if tracking == "NONE":
-                rows.append({"location": default_loc, "quantity": remaining, "code": None, "uom": uom, "tracking_type": "NONE"})
-            elif self.gen.get():
-                generated = make_lots(remaining, uom, self.v["gen_n"].get().strip(), tracking=tracking)
-                rows.extend({"location": default_loc, "quantity": q, "code": c, "uom": uom, "tracking_type": tracking}
-                            for c, q in generated)
-            else:
-                raise ValueError("Tracked quantity must be fully allocated with codes or auto-generated.")
-        if not rows and total_qty > 0:
-            default_loc = self.v["loc"].get().strip()
-            if not default_loc:
-                raise ValueError("Location is required when quantity is entered.")
-            if tracking == "NONE":
-                rows.append({"location": default_loc, "quantity": total_qty, "code": None, "uom": uom, "tracking_type": "NONE"})
-            elif self.gen.get():
-                generated = make_lots(total_qty, uom, self.v["gen_n"].get().strip(), tracking=tracking)
-                rows.extend({"location": default_loc, "quantity": q, "code": c, "uom": uom, "tracking_type": tracking}
-                            for c, q in generated)
-            else:
-                raise ValueError("Tracked quantity requires allocation rows and codes.")
+        if abs(allocated - total_qty) > 1e-6:
+            raise ValueError("Allocation quantities must total exactly the product quantity.")
         return rows
 
     def draw_distribution_table(self, parent, lots):
@@ -2166,14 +2249,13 @@ class ProductCard(tk.Frame):
                 if dash and not re.fullmatch(r"\d{2}", dash):
                     raise ValueError("Dash number must be 2 digits, e.g. 01.")
             qty = self.qty()
-            if qty is not None and not v["loc"]:
-                raise ValueError("Location is required when a quantity is entered.")
             if qty is not None and not v["uom"]:
                 raise ValueError("Choose a unit of measure.")
             uom = v["uom"]
             match = next((u for u in self.uoms if _norm(u) == _norm(uom)), None)
             uom = match or re.sub(r"\s+", " ", uom)  # reuse the existing spelling if it's a duplicate
             lots = self.parse_allocations(qty, uom) if qty is not None else []
+            locs = sorted({l["location"] for l in lots if l.get("location")}, key=str.casefold)
             min_q = None
             if self.low.get():
                 try:
@@ -2184,7 +2266,7 @@ class ProductCard(tk.Frame):
             self.err.config(text=str(e))
             return
         rec = dict(item_number=v["num"], name=v["name"], category=v["cat"], quantity=qty,
-                   uom=uom if qty is not None else None, location=v["loc"] or None, manufacturer=v["mfr"] or None,
+                   uom=uom if qty is not None else None, location=", ".join(locs) if locs else None, manufacturer=v["mfr"] or None,
                    notes=self.notes.get("1.0", "end").strip() or None, tracking=self.track.get(),
                    low_stock_alert="Yes" if self.low.get() else "No", min_quantity=min_q,
                    subcategory=v["sub"][:4], revision=rev, dash_number=dash,
