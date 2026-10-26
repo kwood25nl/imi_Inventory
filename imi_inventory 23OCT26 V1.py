@@ -12,7 +12,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import msoffcrypto
 import openpyxl
@@ -47,11 +47,13 @@ SCHEMA = {
     "Counters": ["category", "last_sequence"],
     "Users": ["initials", "first_name", "last_name", "email", "registered_at"],
     "UoM": ["name"],
-    "Locations": ["name"],
-    "Lots": ["item_number", "lot_code", "quantity", "uom", "location", "created_at"],
+    "Locations": ["name", "parent", "archived", "is_virtual", "created_at"],
+    "Lots": ["item_number", "lot_code", "quantity", "uom", "location", "created_at", "tracking_type", "status", "created_by"],
     "Activity": ["timestamp", "initials", "message"],
 }
 FMT = "%Y-%m-%d %H:%M:%S"
+TOP_LOCATIONS = ["LAB L3-052", "LAB L3-057", "Office R3-003", "Workshop", "AVL", "Virtual Location"]
+SCRAP_LOCATION = "scrap"
 
 
 class FileBusy(Exception):
@@ -135,7 +137,10 @@ def _create_file():
         wb.create_sheet(name).append(cols)
     for u in DEFAULT_UOMS:
         wb["UoM"].append([u])
-    wb["Locations"].append(["Virtual Intake"])
+    now = _now()
+    for name in TOP_LOCATIONS:
+        wb["Locations"].append([name, None, "No", "Yes" if name == "Virtual Location" else "No", now])
+    wb["Locations"].append([SCRAP_LOCATION, "Virtual Location", "No", "Yes", now])
     with open(DATA_FILE, "wb") as f:
         f.write(_encrypt(wb))
     _hide(DATA_FILE)
@@ -186,6 +191,123 @@ def _ensure(wb):
             if c not in have:
                 have.append(c)
                 ws.cell(row=1, column=len(have), value=c)
+    _ensure_locations(wb)
+    _ensure_lots_compat(wb)
+    _ensure_item_inventory_rows(wb)
+
+
+def _ensure_locations(wb):
+    ws = wb["Locations"]
+    rows = _rows(ws)
+    now = _now()
+    if rows and all(r.get("parent") is None and r.get("archived") is None and r.get("is_virtual") is None for r in rows):
+        old = [r["name"] for r in rows if r.get("name")]
+        ws.delete_rows(2, ws.max_row)
+        for name in old:
+            ws.append([name, None, "No", "No", now])
+    have = {_norm(r.get("name")) for r in _rows(ws) if r.get("name")}
+    for name in TOP_LOCATIONS:
+        if _norm(name) not in have:
+            ws.append([name, None, "No", "Yes" if name == "Virtual Location" else "No", now])
+            have.add(_norm(name))
+    if _norm(SCRAP_LOCATION) not in have:
+        ws.append([SCRAP_LOCATION, "Virtual Location", "No", "Yes", now])
+
+
+def _ensure_lots_compat(wb):
+    ws = wb["Lots"]
+    head = [c.value for c in ws[1]]
+    idx = {k: head.index(k) + 1 for k in head}
+    for r in range(2, ws.max_row + 1):
+        code = ws.cell(r, idx["lot_code"]).value if "lot_code" in idx else None
+        if "tracking_type" in idx and not ws.cell(r, idx["tracking_type"]).value:
+            ws.cell(r, idx["tracking_type"]).value = "LOT" if str(code or "").strip() else "NONE"
+        if "status" in idx and not ws.cell(r, idx["status"]).value:
+            ws.cell(r, idx["status"]).value = "active"
+
+
+def _location_map(wb):
+    return {r["name"]: r for r in _rows(wb["Locations"]) if r.get("name") and r.get("archived") != "Yes"}
+
+
+def _is_scrap_location(name, loc_map):
+    name = str(name or "")
+    if _norm(name) == _norm(SCRAP_LOCATION):
+        cur = name
+        seen = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            row = loc_map.get(cur) or {}
+            if _norm(cur) == _norm("Virtual Location"):
+                return True
+            cur = row.get("parent")
+        return False
+    cur = name
+    seen = set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        row = loc_map.get(cur) or {}
+        if _norm(cur) == _norm(SCRAP_LOCATION) and _norm(row.get("parent") or "") == _norm("Virtual Location"):
+            return True
+        cur = row.get("parent")
+    return False
+
+
+def _lot_rows(wb):
+    out = []
+    for r in _rows(wb["Lots"]):
+        out.append({
+            "item_number": r.get("item_number"),
+            "code": str(r.get("lot_code") or "").strip(),
+            "quantity": float(r.get("quantity") or 0),
+            "uom": r.get("uom"),
+            "location": r.get("location"),
+            "created_at": r.get("created_at"),
+            "tracking_type": (r.get("tracking_type") or ("LOT" if str(r.get("lot_code") or "").strip() else "NONE")).upper(),
+            "status": (r.get("status") or "active").lower(),
+            "created_by": r.get("created_by"),
+        })
+    return [r for r in out if r["item_number"] and r["quantity"] not in (None, 0) and r["status"] != "archived"]
+
+
+def _item_totals(items, lot_rows, loc_map):
+    by_item = {}
+    for r in lot_rows:
+        by_item.setdefault(r["item_number"], []).append(r)
+    out = {}
+    for it in items:
+        n = it["item_number"]
+        rows = by_item.get(n, [])
+        avail_rows = [r for r in rows if not _is_scrap_location(r.get("location"), loc_map)]
+        qty = round(sum(float(r["quantity"] or 0) for r in avail_rows), 6) if rows else it.get("quantity")
+        locs = sorted({str(r.get("location") or "") for r in avail_rows if r.get("location")})
+        out[n] = {"quantity": qty, "location": ", ".join(locs)}
+    return out
+
+
+def _recalc_item_totals(wb):
+    items = _rows(wb["Items"])
+    loc_map = _location_map(wb)
+    totals = _item_totals(items, _lot_rows(wb), loc_map)
+    ws = wb["Items"]
+    head = [c.value for c in ws[1]]
+    for r in range(2, ws.max_row + 1):
+        num = ws.cell(r, head.index("item_number") + 1).value
+        if num in totals:
+            ws.cell(r, head.index("quantity") + 1).value = totals[num]["quantity"]
+            ws.cell(r, head.index("location") + 1).value = totals[num]["location"] or None
+
+
+def _ensure_item_inventory_rows(wb):
+    lots = _rows(wb["Lots"])
+    has = {r.get("item_number") for r in lots if r.get("item_number")}
+    for it in _rows(wb["Items"]):
+        if it.get("item_number") in has:
+            continue
+        if it.get("quantity") in (None, 0) or not it.get("location"):
+            continue
+        wb["Lots"].append([it["item_number"], None, it["quantity"], it.get("uom"), it.get("location"), _now(),
+                           (it.get("tracking") or "NONE"), "active", it.get("created_by")])
 
 
 def _append(ws, rec):
@@ -262,7 +384,8 @@ def _set_counter(wb, code, seq):
 class DB:
     def lookups(self):
         with transaction() as wb:
-            return ([r["name"] for r in _rows(wb["UoM"])], [r["name"] for r in _rows(wb["Locations"])])
+            locs = [r["name"] for r in _rows(wb["Locations"]) if r.get("name") and r.get("archived") != "Yes"]
+            return ([r["name"] for r in _rows(wb["UoM"])], sorted(locs, key=str.casefold))
 
     def items(self):
         with transaction() as wb:
@@ -277,12 +400,19 @@ class DB:
             return _pick_sequence(wb, code, _rows(wb["Items"]))
 
     def find_data(self):
-        """All items plus {item_number: [lot codes]} for the Find window and item cards."""
+        """All items plus {item_number: [allocation rows]} for the Find window and item cards."""
         with transaction() as wb:
+            items = _rows(wb["Items"])
+            loc_map = _location_map(wb)
             lots = {}
-            for l in _rows(wb["Lots"]):
-                lots.setdefault(l["item_number"], []).append(str(l["lot_code"]))
-            return _rows(wb["Items"]), lots
+            for l in _lot_rows(wb):
+                lots.setdefault(l["item_number"], []).append(l)
+            totals = _item_totals(items, _lot_rows(wb), loc_map)
+            for i in items:
+                t = totals.get(i["item_number"], {})
+                i["quantity"] = t.get("quantity", i.get("quantity"))
+                i["location"] = t.get("location", i.get("location"))
+            return items, lots
 
     def update_item(self, number, changes, user):
         with transaction(write=True) as wb:
@@ -319,6 +449,7 @@ class DB:
                 for lr in range(2, lw.max_row + 1):
                     if lw.cell(lr, 1).value == number:
                         lw.cell(lr, 1).value = new
+                _recalc_item_totals(wb)
                 _log(wb, user, f"Rolled revision: {number} to {new}, all stock converted")
             else:
                 row = {h: ws.cell(r, i + 1).value for i, h in enumerate(head)}
@@ -386,30 +517,154 @@ class DB:
             rec.update(created_at=now, created_by=user, edited_at=now, edited_by=user, status="Active")
             _append(wb["Items"], rec)
             for lot in lots:
-                wb["Lots"].append([num, lot[0], lot[1], rec["uom"], rec["location"], now])
+                wb["Lots"].append([num, lot.get("code"), lot["quantity"], lot.get("uom") or rec["uom"], lot["location"], now,
+                                   lot.get("tracking_type") or rec.get("tracking") or "NONE", "active", user])
+            _recalc_item_totals(wb)
             _log(wb, user, f"Created item: {num} {rec['name']}")
             return num
 
+    def location_rows(self):
+        with transaction() as wb:
+            return [r for r in _rows(wb["Locations"]) if r.get("name")]
+
+    def save_location(self, name, parent=None, user=None):
+        name = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not name:
+            raise ValueError("Location name is required.")
+        with transaction(write=True) as wb:
+            rows = _rows(wb["Locations"])
+            if any(_norm(r.get("name")) == _norm(name) for r in rows):
+                raise ValueError(f"Location '{name}' already exists.")
+            if parent and not any(_norm(r.get("name")) == _norm(parent) for r in rows if r.get("archived") != "Yes"):
+                raise ValueError(f"Parent location '{parent}' does not exist.")
+            is_virtual = "Yes" if (_norm(name) == _norm("Virtual Location") or _norm(parent or "") == _norm("Virtual Location")) else "No"
+            wb["Locations"].append([name, parent or None, "No", is_virtual, _now()])
+            _log(wb, user or "SYS", f"Added location: {name}" + (f" under {parent}" if parent else ""))
+
+    def rename_location(self, old_name, new_name, user=None):
+        new_name = re.sub(r"\s+", " ", str(new_name or "")).strip()
+        if not new_name:
+            raise ValueError("New location name is required.")
+        with transaction(write=True) as wb:
+            ws = wb["Locations"]
+            rows = _rows(ws)
+            if any(_norm(r.get("name")) == _norm(new_name) for r in rows):
+                raise ValueError(f"Location '{new_name}' already exists.")
+            row = next((i for i, r in enumerate(rows, 2) if _norm(r.get("name")) == _norm(old_name)), None)
+            if row is None:
+                raise ValueError(f"Location '{old_name}' was not found.")
+            head = [c.value for c in ws[1]]
+            ws.cell(row, head.index("name") + 1).value = new_name
+            for i, r in enumerate(rows, 2):
+                if _norm(r.get("parent") or "") == _norm(old_name):
+                    ws.cell(i, head.index("parent") + 1).value = new_name
+            lws = wb["Lots"]
+            lhead = [c.value for c in lws[1]]
+            for i in range(2, lws.max_row + 1):
+                if _norm(lws.cell(i, lhead.index("location") + 1).value or "") == _norm(old_name):
+                    lws.cell(i, lhead.index("location") + 1).value = new_name
+            _recalc_item_totals(wb)
+            _log(wb, user or "SYS", f"Renamed location: {old_name} to {new_name}")
+
+    def archive_location(self, name, user=None):
+        with transaction(write=True) as wb:
+            if any(_norm(r.get("location") or "") == _norm(name) and float(r.get("quantity") or 0) > 0 for r in _lot_rows(wb)):
+                raise ValueError(f"Cannot archive '{name}' because inventory is still assigned to it.")
+            ws = wb["Locations"]
+            rows = _rows(ws)
+            row = next((i for i, r in enumerate(rows, 2) if _norm(r.get("name")) == _norm(name)), None)
+            if row is None:
+                raise ValueError(f"Location '{name}' was not found.")
+            head = [c.value for c in ws[1]]
+            ws.cell(row, head.index("archived") + 1).value = "Yes"
+            _log(wb, user or "SYS", f"Archived location: {name}")
+
+    def move_adjust_inventory(self, item_number, from_loc, to_loc, qty, tracking_code, action, user):
+        if qty <= 0:
+            raise ValueError("Quantity must be greater than zero.")
+        with transaction(write=True) as wb:
+            ws = wb["Lots"]
+            head = [c.value for c in ws[1]]
+            items = {i["item_number"]: i for i in _rows(wb["Items"])}
+            item = items.get(item_number)
+            if not item:
+                raise ValueError(f"Item {item_number} was not found.")
+            track = (item.get("tracking") or "NONE").upper()
+            code = str(tracking_code or "").strip()
+            lots = _lot_rows(wb)
+            if action == "Add":
+                if track in ("LOT", "SN") and not code:
+                    raise ValueError(f"{track} tracking requires a code.")
+                if track == "SN" and qty != 1:
+                    raise ValueError("SN tracking moves one unit per serial number.")
+                if track == "SN" and any(_norm(r.get("code")) == _norm(code) and _norm(r["item_number"]) == _norm(item_number) for r in lots):
+                    raise ValueError(f"Serial number '{code}' already exists for {item_number}.")
+                ws.append([item_number, code or None, qty, item.get("uom"), to_loc, _now(), track, "active", user])
+            else:
+                remaining = qty
+                matches = [r for r in lots if _norm(r["item_number"]) == _norm(item_number) and _norm(r.get("location") or "") == _norm(from_loc or "")]
+                if code:
+                    matches = [r for r in matches if _norm(r.get("code")) == _norm(code)]
+                if track == "SN":
+                    if not code:
+                        raise ValueError("SN tracking requires a serial number for move/scrap.")
+                    if qty != 1:
+                        raise ValueError("SN tracking moves one unit per serial number.")
+                if sum(m["quantity"] for m in matches) < qty:
+                    raise ValueError("Not enough inventory in the selected location/code.")
+                for i in range(2, ws.max_row + 1):
+                    if remaining <= 0:
+                        break
+                    r_item = ws.cell(i, head.index("item_number") + 1).value
+                    r_loc = ws.cell(i, head.index("location") + 1).value
+                    r_code = ws.cell(i, head.index("lot_code") + 1).value
+                    r_qty = float(ws.cell(i, head.index("quantity") + 1).value or 0)
+                    if _norm(r_item or "") != _norm(item_number) or _norm(r_loc or "") != _norm(from_loc or ""):
+                        continue
+                    if code and _norm(r_code or "") != _norm(code):
+                        continue
+                    take = min(r_qty, remaining)
+                    ws.cell(i, head.index("quantity") + 1).value = r_qty - take
+                    remaining -= take
+                    if action == "Move":
+                        ws.append([item_number, r_code, take, item.get("uom"), to_loc, _now(), track, "active", user])
+                    elif action == "Scrap":
+                        ws.append([item_number, r_code, take, item.get("uom"), SCRAP_LOCATION, _now(), track, "active", user])
+            _recalc_item_totals(wb)
+            _log(wb, user, f"{action} inventory: {item_number} qty {qty:g}" +
+                 (f" from {from_loc}" if from_loc else "") + (f" to {to_loc}" if to_loc else ""))
+
 
 # ---------------------------------------------------------- lot generator
-def make_lots(qty, uom, count_text, today=None):
-    """YYJJJ lot codes; '-n' suffix when more than one. Returns [(code, qty)]."""
+def make_lots(qty, uom, count_text, tracking="LOT", today=None):
+    """Generate LOT/SN tracking codes. Returns [(code, qty)]."""
     today = today or dt.date.today()
     base = f"{today:%y}{today.timetuple().tm_yday:03d}"
+    tracking = (tracking or "LOT").upper()
     discrete = _norm(uom) in DISCRETE_UOMS
     txt = count_text.strip()
+    if tracking == "SN" and (not discrete or qty != int(qty)):
+        raise ValueError("SN tracking requires a whole-number discrete quantity.")
     if txt.upper() in ("", "ALL"):
-        if discrete and qty != int(qty):
-            raise ValueError("Discrete quantities must be whole numbers to generate lot codes.")
-        n = int(qty) if discrete else 1
+        if tracking == "SN":
+            n = int(qty)
+        else:
+            if discrete and qty != int(qty):
+                raise ValueError("Discrete quantities must be whole numbers to generate lot codes.")
+            n = int(qty) if discrete else 1
     else:
         if not txt.isdigit() or int(txt) < 1:
             raise ValueError("Lot code count must be a whole number of at least 1, or ALL.")
         n = int(txt)
-    if n > qty:
+    if tracking == "SN" and n != int(qty):
+        raise ValueError("SN code count must equal the SN quantity.")
+    if n > qty and tracking != "SN":
         raise ValueError("The number of lot codes cannot exceed the quantity.")
-    codes = [base] if n == 1 else [f"{base}-{i}" for i in range(1, n + 1)]
-    if discrete:
+    code_prefix = "SN" if tracking == "SN" else ""
+    codes = [f"{code_prefix}{base}"] if n == 1 else [f"{code_prefix}{base}-{i}" for i in range(1, n + 1)]
+    if tracking == "SN":
+        shares = [1] * n
+    elif discrete:
         q, r = divmod(int(qty), n)
         shares = [q + (1 if i < r else 0) for i in range(n)]
     else:
@@ -443,6 +698,36 @@ def mk_button(parent, text, cmd, primary=False):
     return tk.Button(parent, text=text, command=cmd, relief="flat", bd=0, font=BOLD, padx=22, pady=8,
                      bg="#6BC950" if primary else PANEL2, fg="#10120F" if primary else TXT,
                      activebackground="#31355A", activeforeground=TXT, cursor="hand2")
+
+
+def simple_prompt(parent, title, prompt):
+    return simpledialog.askstring(title, prompt, parent=parent)
+
+
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget, self.text = widget, text
+        self.tip = None
+        for ev in ("<Enter>", "<FocusIn>"):
+            widget.bind(ev, self.show, add="+")
+        for ev in ("<Leave>", "<FocusOut>"):
+            widget.bind(ev, self.hide, add="+")
+
+    def show(self, _=None):
+        if self.tip:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.overrideredirect(True)
+        self.tip.geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, bg="#0F1016", fg=TXT, relief="solid", bd=1,
+                 font=("Segoe UI", 9), justify="left", padx=8, pady=6, wraplength=340).pack()
+
+    def hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
 
 
 class Toggle(tk.Canvas):
@@ -568,8 +853,15 @@ class App(tk.Tk):
                     borderwidth=0, font=FONT)
         s.configure("Treeview.Heading", background=PANEL2, foreground=TXT, relief="flat", font=BOLD, padding=6)
         s.map("Treeview", background=[("selected", "#31355A")])
-        s.configure("Vertical.TScrollbar", background="#6A7088", troughcolor="#23263A", bordercolor="#23263A",
-                    arrowcolor=TXT)
+        s.layout("Modern.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})
+            ]})
+        ])
+        s.configure("Modern.Vertical.TScrollbar", gripcount=0, background="#7680A8", darkcolor="#7680A8",
+                    lightcolor="#7680A8", troughcolor="#202333", bordercolor="#202333", arrowcolor="#202333",
+                    relief="flat")
+        s.map("Modern.Vertical.TScrollbar", background=[("active", "#8E98C4"), ("pressed", "#A2ABCF")])
 
     def _header(self):
         box = tk.Frame(self, bg=HEADER)
@@ -623,7 +915,7 @@ class App(tk.Tk):
         row = tk.Frame(self, bg=BG)
         row.pack(fill="x", padx=32, pady=(20, 0))
         self.act = {}
-        cmds = [self.show_find, self.show_create, self._soon, self._soon]
+        cmds = [self.show_find, self.show_create, self.show_inventory, self._soon]
         for i, ((label, color), cmd) in enumerate(zip(ACTIONS, cmds)):
             row.columnconfigure(i, weight=1, uniform="a")
             cell = tk.Frame(row, bg=DIS_BD, highlightthickness=1, highlightbackground=DIS_BD)
@@ -655,7 +947,7 @@ class App(tk.Tk):
         wrap.pack(fill="x")
         self.log = tk.Text(wrap, height=4, bg=PANEL, fg=TXT, relief="flat", font=("Segoe UI", 10), state="disabled",
                            tabs=("170", "230"), padx=12, pady=4, spacing1=4, spacing3=4, cursor="arrow")
-        sb = ttk.Scrollbar(wrap, command=self.log.yview)
+        sb = ttk.Scrollbar(wrap, style="Modern.Vertical.TScrollbar", command=self.log.yview)
         self.log.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log.pack(side="left", fill="x", expand=True)
@@ -774,6 +1066,10 @@ class App(tk.Tk):
         if self.user:
             self._swap(ProductCard(self.content, self))
 
+    def show_inventory(self):
+        if self.user:
+            self._swap(InventoryView(self.content, self))
+
 
 ROW_H = 34
 GREEN, GREY = "#2E8B47", "#565B70"
@@ -807,6 +1103,17 @@ class FindView(tk.Frame):
         e.focus_set()
         self.q.trace_add("write", lambda *a: self.fill())
         mk_button(bar, "Refresh", self.load).pack(side="left", padx=(10, 0))
+        fbar = tk.Frame(self, bg=PANEL)
+        fbar.pack(fill="x", pady=(2, 6))
+        self.filters = {k: tk.StringVar(value="(All)") for k in ("category", "quantity", "location", "status")}
+        self.fw = {}
+        for key, title in (("category", "Category"), ("quantity", "Quantity"), ("location", "Location"), ("status", "Status")):
+            tk.Label(fbar, text=title, bg=PANEL, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
+            cb = ttk.Combobox(fbar, textvariable=self.filters[key], state="readonly", width=20, font=("Segoe UI", 10))
+            cb.pack(side="left", padx=(0, 10))
+            cb.bind("<<ComboboxSelected>>", lambda _e: self.fill())
+            self.fw[key] = cb
+        mk_button(fbar, "Clear Filters", self.clear_filters).pack(side="left", padx=(6, 0))
         tk.Label(self, text="Searches item number, name, manufacturer, description/notes, category and lot codes.",
                  bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
         grid = tk.Frame(self, bg=PANEL)
@@ -817,7 +1124,7 @@ class FindView(tk.Frame):
         self.head.grid(row=0, column=0, sticky="ew")
         self.body = tk.Canvas(grid, bg=PANEL, highlightthickness=0, yscrollincrement=ROW_H)
         self.body.grid(row=1, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(grid, command=self.body.yview)
+        sb = ttk.Scrollbar(grid, style="Modern.Vertical.TScrollbar", command=self.body.yview)
         sb.grid(row=1, column=1, sticky="ns")
         self.body.config(yscrollcommand=sb.set)
         self.empty = tk.Label(self, text="", bg=PANEL, fg=MUTED, font=FONT)
@@ -839,7 +1146,8 @@ class FindView(tk.Frame):
         self.items, self.lots = data if data else ([], {})
         self.hay = {i["item_number"]: " ".join(str(x or "") for x in (
             i["item_number"], i["name"], i["manufacturer"], i["notes"], i["category"],
-            " ".join(self.lots.get(i["item_number"], [])))).casefold() for i in self.items}
+            " ".join(r.get("code", "") for r in self.lots.get(i["item_number"], [])))).casefold() for i in self.items}
+        self.refresh_filter_options()
         self.fill()
 
     def skey(self, i):
@@ -852,10 +1160,35 @@ class FindView(tk.Frame):
     def fill(self):
         toks = self.q.get().casefold().split()
         hits = [i for i in self.items if all(t in self.hay[i["item_number"]] for t in toks)]
+        if self.filters["category"].get() != "(All)":
+            hits = [i for i in hits if (i.get("category") or "") == self.filters["category"].get()]
+        if self.filters["quantity"].get() != "(All)":
+            hits = [i for i in hits if ("" if i.get("quantity") is None else f"{i['quantity']:g} {i.get('uom') or ''}".strip()) == self.filters["quantity"].get()]
+        if self.filters["location"].get() != "(All)":
+            hits = [i for i in hits if (i.get("location") or "") == self.filters["location"].get()]
+        if self.filters["status"].get() != "(All)":
+            hits = [i for i in hits if status_of(i) == self.filters["status"].get()]
         self.rows = sorted(hits, key=self.skey, reverse=not self.asc)
         self.empty.config(text="" if hits else ("No items match your search." if self.items else "No items yet."))
         self.body.yview_moveto(0)
         self.redraw()
+
+    def clear_filters(self):
+        for v in self.filters.values():
+            v.set("(All)")
+        self.fill()
+
+    def refresh_filter_options(self):
+        cats = sorted({i.get("category") for i in self.items if i.get("category")}, key=str.casefold)
+        qtys = sorted({("" if i.get("quantity") is None else f"{i['quantity']:g} {i.get('uom') or ''}".strip()) for i in self.items if i.get("quantity") is not None}, key=str.casefold)
+        locs = sorted({i.get("location") for i in self.items if i.get("location")}, key=str.casefold)
+        stats = sorted({status_of(i) for i in self.items}, key=str.casefold)
+        vals = {"category": cats, "quantity": qtys, "location": locs, "status": stats}
+        for k, cb in self.fw.items():
+            keep = self.filters[k].get()
+            cb["values"] = ["(All)"] + vals[k]
+            if keep not in cb["values"]:
+                self.filters[k].set("(All)")
 
     # -- drawing
     def layout(self):
@@ -933,6 +1266,193 @@ class FindView(tk.Frame):
         self.app.show_item(self.rows[r]["item_number"], "edit" if pencil else "view")
 
 
+class InventoryView(tk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, bg=PANEL, padx=24, pady=20)
+        self.app = app
+        self.query = tk.StringVar()
+        self.mode = tk.StringVar(value="tree")
+        self.act = tk.StringVar(value="Move")
+        self.item = tk.StringVar()
+        self.src = tk.StringVar()
+        self.dst = tk.StringVar()
+        self.qty = tk.StringVar()
+        self.code = tk.StringVar()
+        tk.Label(self, text="Adjust / Move Inventory", bg=PANEL, fg=TXT, font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        top = tk.Frame(self, bg=PANEL)
+        top.pack(fill="x", pady=(10, 8))
+        mk_entry(top, self.query).pack(side="left", fill="x", expand=True, ipady=6)
+        self.query.trace_add("write", lambda *_: self.refresh())
+        ttk.Combobox(top, textvariable=self.mode, state="readonly", values=["tree", "table"], width=8, font=FONT).pack(side="left", padx=(10, 0))
+        self.mode.trace_add("write", lambda *_: self.refresh())
+        mk_button(top, "Refresh", self.load).pack(side="left", padx=(10, 0))
+        body = tk.Frame(self, bg=PANEL)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.tv = ttk.Treeview(body, columns=("item", "qty", "uom", "tracking", "code"), show="tree headings")
+        for c, t, w in (("#0", "Location", 260), ("item", "Item", 220), ("qty", "Qty", 90), ("uom", "UoM", 120), ("tracking", "Tracking", 90), ("code", "Code", 180)):
+            self.tv.heading(c, text=t)
+            self.tv.column(c, width=w, anchor="w")
+        self.tv.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(body, style="Modern.Vertical.TScrollbar", command=self.tv.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.tv.configure(yscrollcommand=sb.set)
+        form = tk.Frame(self, bg=PANEL2, highlightthickness=1, highlightbackground=BORDER, padx=12, pady=10)
+        form.pack(fill="x", pady=(10, 0))
+        ttk.Combobox(form, textvariable=self.act, state="readonly", values=["Move", "Add", "Scrap"], width=8, font=FONT).grid(row=0, column=0, padx=(0, 8))
+        self.item_cb = ttk.Combobox(form, textvariable=self.item, state="readonly", width=28, font=FONT)
+        self.item_cb.grid(row=0, column=1, padx=(0, 8))
+        self.src_cb = ttk.Combobox(form, textvariable=self.src, state="readonly", width=22, font=FONT)
+        self.src_cb.grid(row=0, column=2, padx=(0, 8))
+        self.dst_cb = ttk.Combobox(form, textvariable=self.dst, state="readonly", width=22, font=FONT)
+        self.dst_cb.grid(row=0, column=3, padx=(0, 8))
+        mk_entry(form, self.qty, width=10).grid(row=0, column=4, padx=(0, 8), ipady=4)
+        mk_entry(form, self.code, width=16).grid(row=0, column=5, padx=(0, 8), ipady=4)
+        mk_button(form, "Apply", self.apply_move, primary=True).grid(row=0, column=6)
+        mk_button(form, "Add Top Location", self.add_top).grid(row=1, column=0, pady=(8, 0), sticky="w")
+        mk_button(form, "Add Child", self.add_child).grid(row=1, column=1, pady=(8, 0), sticky="w")
+        mk_button(form, "Rename Location", self.rename_loc).grid(row=1, column=2, pady=(8, 0), sticky="w")
+        mk_button(form, "Archive Location", self.archive_loc).grid(row=1, column=3, pady=(8, 0), sticky="w")
+        self.err = tk.Label(self, text="", bg=PANEL, fg=ERR, font=BOLD, anchor="w")
+        self.err.pack(fill="x", pady=(8, 0))
+        self.load()
+
+    def load(self):
+        data = self.app.guarded(self.app.db.find_data)
+        self.items, self.lots = data if data else ([], {})
+        self.item_names = {i["item_number"]: i.get("name") or "" for i in self.items}
+        self.locations = self.app.guarded(self.app.db.location_rows) or []
+        loc_names = [r["name"] for r in self.locations if r.get("archived") != "Yes"]
+        self.item_cb["values"] = [i["item_number"] for i in self.items]
+        self.src_cb["values"] = loc_names
+        self.dst_cb["values"] = loc_names + [SCRAP_LOCATION]
+        self.refresh()
+
+    def filtered_rows(self):
+        q = self.query.get().strip().casefold()
+        out = []
+        for item, rows in self.lots.items():
+            for r in rows:
+                t = " ".join(str(x or "") for x in (r.get("location"), item, self.item_names.get(item), r.get("code"), r.get("tracking_type")))
+                if q and q not in t.casefold():
+                    continue
+                out.append((item, r))
+        return out
+
+    def refresh(self):
+        self.tv.delete(*self.tv.get_children())
+        rows = self.filtered_rows()
+        if self.mode.get() == "table":
+            for item, r in rows:
+                loc = r.get("location") or ""
+                fg = "#6FD6FA" if _norm(loc) in (_norm("Virtual Location"), _norm(SCRAP_LOCATION)) else TXT
+                iid = self.tv.insert("", "end", text=loc, values=(item, f"{float(r.get('quantity') or 0):g}", r.get("uom") or "",
+                                                                   r.get("tracking_type") or "NONE", r.get("code") or ""))
+                self.tv.tag_configure("v", foreground="#6FD6FA")
+                if fg != TXT:
+                    self.tv.item(iid, tags=("v",))
+            return
+        parents = {}
+        idx = {r["name"]: r for r in self.locations if r.get("archived") != "Yes"}
+        for r in self.locations:
+            if r.get("archived") == "Yes":
+                continue
+            name = r["name"]
+            parent = r.get("parent")
+            parent_iid = parents.get(parent, "")
+            iid = self.tv.insert(parent_iid, "end", text=name, values=("", "", "", "", ""))
+            if r.get("is_virtual") == "Yes" or _norm(name) in (_norm("Virtual Location"), _norm(SCRAP_LOCATION)):
+                self.tv.tag_configure("v", foreground="#6FD6FA")
+                self.tv.item(iid, tags=("v",))
+            parents[name] = iid
+        for item, r in rows:
+            loc = r.get("location")
+            pid = parents.get(loc, "")
+            self.tv.insert(pid, "end", text=loc if not pid else "", values=(item, f"{float(r.get('quantity') or 0):g}",
+                                                                              r.get("uom") or "", r.get("tracking_type") or "NONE",
+                                                                              r.get("code") or ""))
+
+    def selected_location(self):
+        sel = self.tv.selection()
+        if not sel:
+            return None
+        node = sel[0]
+        txt = self.tv.item(node, "text")
+        if txt:
+            return txt
+        parent = self.tv.parent(node)
+        return self.tv.item(parent, "text") if parent else None
+
+    def add_top(self):
+        name = simple_prompt(self, "Add Location", "Top-level location name:")
+        if not name:
+            return
+        try:
+            self.app.guarded(self.app.db.save_location, name, None, self.app.user["initials"])
+            self.load()
+        except Exception:
+            return
+
+    def add_child(self):
+        parent = self.selected_location()
+        if not parent:
+            messagebox.showerror("Add child location", "Select a parent location first.")
+            return
+        name = simple_prompt(self, "Add Child Location", f"Child location name under '{parent}':")
+        if not name:
+            return
+        try:
+            self.app.guarded(self.app.db.save_location, name, parent, self.app.user["initials"])
+            self.load()
+        except Exception:
+            return
+
+    def rename_loc(self):
+        old = self.selected_location()
+        if not old:
+            messagebox.showerror("Rename location", "Select a location first.")
+            return
+        has_inv = any(_norm(r.get("location") or "") == _norm(old) for rows in self.lots.values() for r in rows)
+        if has_inv and not messagebox.askyesno("Rename location", f"'{old}' currently contains inventory. Continue renaming?"):
+            return
+        new = simple_prompt(self, "Rename Location", f"Rename '{old}' to:")
+        if not new:
+            return
+        self.app.guarded(self.app.db.rename_location, old, new, self.app.user["initials"])
+        self.load()
+
+    def archive_loc(self):
+        name = self.selected_location()
+        if not name:
+            messagebox.showerror("Archive location", "Select a location first.")
+            return
+        self.app.guarded(self.app.db.archive_location, name, self.app.user["initials"])
+        self.load()
+
+    def apply_move(self):
+        try:
+            item = self.item.get().strip()
+            action = self.act.get()
+            if not item:
+                raise ValueError("Select an item.")
+            qty = float(self.qty.get().strip())
+            src = self.src.get().strip() or None
+            dst = self.dst.get().strip() or None
+            code = self.code.get().strip() or None
+            if action in ("Move", "Scrap") and not src:
+                raise ValueError("Select a source location.")
+            if action == "Move" and not dst:
+                raise ValueError("Select a destination location.")
+            if action == "Add" and not dst:
+                raise ValueError("Select a destination location.")
+            self.app.guarded(self.app.db.move_adjust_inventory, item, src, dst, qty, code, action, self.app.user["initials"])
+            self.err.config(text="")
+            self.load()
+        except ValueError as e:
+            self.err.config(text=str(e))
+
+
 class RevDialog(tk.Toplevel):
     def __init__(self, master, number, cur):
         super().__init__(master, bg=PANEL, padx=28, pady=22)
@@ -1001,7 +1521,7 @@ class ProductCard(tk.Frame):
                                 activeforeground=TXT, cursor="hand2")
         sc = tk.Canvas(self, bg=PANEL, highlightthickness=0, yscrollincrement=24)
         sc.grid(sticky="nsew", pady=(10, 0))
-        ssb = ttk.Scrollbar(self, command=sc.yview)
+        ssb = ttk.Scrollbar(self, style="Modern.Vertical.TScrollbar", command=sc.yview)
         ssb.grid(row=1, column=1, sticky="ns", pady=(10, 0))
         sc.config(yscrollcommand=ssb.set)
         f = self.form = tk.Frame(sc, bg=PANEL)
@@ -1085,7 +1605,13 @@ class ProductCard(tk.Frame):
         fr, _ = cell(4, 0, "Manufacturer")
         self.w_mfr = mk_entry(fr, v["mfr"])
         self.w_mfr.pack(fill="x", ipady=6, pady=(4, 0))
-        fr, _ = cell(4, 1, "Tracking")
+        fr, tlabel = cell(4, 1, "Tracking")
+        info = tk.Label(fr, text="ⓘ", bg=PANEL, fg=FOCUS, font=("Segoe UI", 10, "bold"), cursor="question_arrow", takefocus=1)
+        info.place(relx=1.0, y=0, anchor="ne")
+        ToolTip(info, "Tracking options:\n• None: quantities are tracked without lot/serial codes.\n"
+                      "• LOT: one code can represent multiple units.\n"
+                      "• SN: each serial number is unique and always quantity 1.\n"
+                      "Allocation rows below control how inventory is distributed across locations.")
         r = tk.Frame(fr, bg=PANEL)
         r.pack(fill="x", pady=(4, 0))
         self.radios = []
@@ -1099,19 +1625,32 @@ class ProductCard(tk.Frame):
         self.gen_t = Toggle(r, self.gen, self.sync_tracking)
         self.gen_t.pack(side="left")
         self.gen_n = ttk.Combobox(r, textvariable=v["gen_n"], values=["ALL"], width=6, font=FONT)
-        fr, _ = cell(5, 0, "Low stock notification")
+        afr, _ = cell(5, 0, "Initial allocations", span=2)
+        self.alloc_wrap = tk.Frame(afr, bg=PANEL2, highlightthickness=1, highlightbackground=BORDER, padx=8, pady=8)
+        self.alloc_wrap.pack(fill="x", pady=(4, 0))
+        self.alloc_rows = []
+        h = tk.Frame(self.alloc_wrap, bg=PANEL2)
+        h.pack(fill="x")
+        for txt, w in (("Location", 28), ("Qty", 10), ("Code (LOT/SN)", 18)):
+            tk.Label(h, text=txt, bg=PANEL2, fg=MUTED, font=("Segoe UI", 9, "bold"), width=w, anchor="w").pack(side="left", padx=(0, 8))
+        tk.Button(h, text="+ Add", relief="flat", bd=0, bg=PANEL2, fg=FOCUS, cursor="hand2",
+                  command=self.add_alloc_row).pack(side="right")
+        self.alloc_body = tk.Frame(self.alloc_wrap, bg=PANEL2)
+        self.alloc_body.pack(fill="x", pady=(4, 0))
+        self.add_alloc_row()
+        fr, _ = cell(6, 0, "Low stock notification")
         r = tk.Frame(fr, bg=PANEL)
         r.pack(fill="x", pady=(4, 0))
         self.low_t = Toggle(r, self.low, self.sync_low)
         self.low_t.pack(side="left")
         self.min_lbl = tk.Label(r, text="Alert when below", bg=PANEL, fg=MUTED, font=FONT)
         self.min_e = mk_entry(r, v["min"], width=10)
-        fr, _ = cell(6, 0, "Description / Notes", span=2)
+        fr, _ = cell(7, 0, "Description / Notes", span=2)
         self.notes = tk.Text(fr, height=5, bg=FIELD, fg=TXT, insertbackground=TXT, relief="flat", font=FONT,
                              highlightthickness=2, highlightbackground=BORDER, highlightcolor=FOCUS, wrap="word")
         self.notes.pack(fill="x", pady=(4, 0))
         meta = tk.Frame(f, bg=PANEL2)
-        meta.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        meta.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         if item:
             texts = [f"Created by {item['created_by']} · {fmt_ts(item['created_at'])}",
                      f"Last edited by {item['edited_by']} · {fmt_ts(item['edited_at'])}"]
@@ -1120,8 +1659,7 @@ class ProductCard(tk.Frame):
         for t in texts:
             tk.Label(meta, text=t, bg=PANEL2, fg=MUTED, font=("Segoe UI", 10), padx=12, pady=6).pack(side="left")
         if lots:
-            tk.Label(f, text="Lot codes: " + ", ".join(lots), bg=PANEL, fg=TXT, font=FONT, wraplength=900,
-                     justify="left").grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            self.draw_distribution_table(f, lots)
         self.err = tk.Label(self, text="", bg=PANEL, fg=ERR, font=BOLD, anchor="w")
         self.err.grid(sticky="ew", pady=(8, 0), columnspan=2)
         self.bar = tk.Frame(self, bg=PANEL)
@@ -1130,6 +1668,8 @@ class ProductCard(tk.Frame):
         self.items = (app.guarded(app.db.items) or []) if creating else []
         self.existing = {_norm(i["item_number"]) for i in self.items}
         self.seq, self._forced, self._dup_shown = None, False, False
+        if not creating:
+            self.alloc_wrap.pack_forget()
         if creating:
             v["num"].trace_add("write", lambda *a: self.check_dup())
             for k in ("sub", "rev"):
@@ -1478,7 +2018,7 @@ class ProductCard(tk.Frame):
         self.sync_tracking()
 
     def sync_tracking(self):
-        can = self.mode == "create" and self.track.get() == "LOT" and bool(self.v["qty"].get().strip())
+        can = self.mode == "create" and self.track.get() in ("LOT", "SN") and bool(self.v["qty"].get().strip())
         if not can:
             self.gen.set(False)
         self.gen_t.set_enabled(can)
@@ -1486,6 +2026,9 @@ class ProductCard(tk.Frame):
             self.gen_n.pack(side="left", padx=(10, 0))
         else:
             self.gen_n.pack_forget()
+        for row in self.alloc_rows:
+            state = "normal" if self.track.get() in ("LOT", "SN") else "disabled"
+            row["code_w"].config(state=state)
 
     def sync_low(self):
         if self.low.get():
@@ -1494,6 +2037,113 @@ class ProductCard(tk.Frame):
         else:
             self.min_lbl.pack_forget()
             self.min_e.pack_forget()
+
+    def add_alloc_row(self):
+        row = tk.Frame(self.alloc_body, bg=PANEL2)
+        row.pack(fill="x", pady=2)
+        loc = tk.StringVar()
+        qty = tk.StringVar()
+        code = tk.StringVar()
+        lw = ttk.Combobox(row, textvariable=loc, values=self.locs, state="readonly", width=28, font=("Segoe UI", 10))
+        lw.pack(side="left", padx=(0, 8))
+        qw = mk_entry(row, qty, width=10)
+        qw.pack(side="left", padx=(0, 8), ipady=3)
+        cw = mk_entry(row, code, width=18)
+        cw.pack(side="left", padx=(0, 8), ipady=3)
+        tk.Button(row, text="−", relief="flat", bd=0, bg=PANEL2, fg=ERR, cursor="hand2",
+                  command=lambda fr=row: self.remove_alloc_row(fr)).pack(side="left")
+        self.alloc_rows.append({"frame": row, "loc": loc, "qty": qty, "code": code, "code_w": cw})
+        self.sync_tracking()
+
+    def remove_alloc_row(self, frame):
+        if len(self.alloc_rows) == 1:
+            self.alloc_rows[0]["loc"].set("")
+            self.alloc_rows[0]["qty"].set("")
+            self.alloc_rows[0]["code"].set("")
+            return
+        self.alloc_rows = [r for r in self.alloc_rows if r["frame"] is not frame]
+        frame.destroy()
+
+    def parse_allocations(self, total_qty, uom):
+        tracking = self.track.get()
+        rows, serials = [], set()
+        for r in self.alloc_rows:
+            loc = r["loc"].get().strip()
+            qtxt = r["qty"].get().strip()
+            code = r["code"].get().strip()
+            if not any((loc, qtxt, code)):
+                continue
+            if not loc:
+                raise ValueError("Allocation row location is required.")
+            try:
+                q = float(qtxt)
+            except ValueError:
+                raise ValueError("Allocation row quantity must be numeric.")
+            if q <= 0:
+                raise ValueError("Allocation row quantity must be greater than zero.")
+            if tracking == "SN":
+                if q != 1:
+                    raise ValueError("SN allocation rows must have quantity 1.")
+                if not code:
+                    raise ValueError("SN allocations require a serial number.")
+                if _norm(code) in serials:
+                    raise ValueError(f"Duplicate serial number '{code}'.")
+                serials.add(_norm(code))
+            elif tracking == "LOT" and not code:
+                raise ValueError("LOT allocations require a lot code.")
+            elif tracking == "NONE":
+                code = ""
+            rows.append({"location": loc, "quantity": q, "code": code or None, "uom": uom, "tracking_type": tracking})
+        allocated = round(sum(r["quantity"] for r in rows), 6)
+        if allocated > total_qty + 1e-9:
+            raise ValueError("Allocated quantity cannot exceed entered quantity.")
+        remaining = round(total_qty - allocated, 6)
+        if remaining > 1e-9:
+            default_loc = self.v["loc"].get().strip()
+            if not default_loc:
+                raise ValueError("Location is required for unallocated quantity.")
+            if tracking == "NONE":
+                rows.append({"location": default_loc, "quantity": remaining, "code": None, "uom": uom, "tracking_type": "NONE"})
+            elif self.gen.get():
+                generated = make_lots(remaining, uom, self.v["gen_n"].get().strip(), tracking=tracking)
+                rows.extend({"location": default_loc, "quantity": q, "code": c, "uom": uom, "tracking_type": tracking}
+                            for c, q in generated)
+            else:
+                raise ValueError("Tracked quantity must be fully allocated with codes or auto-generated.")
+        if not rows and total_qty > 0:
+            default_loc = self.v["loc"].get().strip()
+            if not default_loc:
+                raise ValueError("Location is required when quantity is entered.")
+            if tracking == "NONE":
+                rows.append({"location": default_loc, "quantity": total_qty, "code": None, "uom": uom, "tracking_type": "NONE"})
+            elif self.gen.get():
+                generated = make_lots(total_qty, uom, self.v["gen_n"].get().strip(), tracking=tracking)
+                rows.extend({"location": default_loc, "quantity": q, "code": c, "uom": uom, "tracking_type": tracking}
+                            for c, q in generated)
+            else:
+                raise ValueError("Tracked quantity requires allocation rows and codes.")
+        return rows
+
+    def draw_distribution_table(self, parent, lots):
+        box = tk.Frame(parent, bg=PANEL2, highlightthickness=1, highlightbackground=BORDER, padx=8, pady=6)
+        box.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        tk.Label(box, text="Inventory distribution", bg=PANEL2, fg=TXT, font=BOLD).pack(anchor="w", pady=(0, 4))
+        head = tk.Frame(box, bg=PANEL2)
+        head.pack(fill="x")
+        for txt, w in (("Location", 24), ("Quantity", 12), ("UoM", 16), ("Tracking", 8), ("Code", 20)):
+            tk.Label(head, text=txt, width=w, anchor="w", bg=PANEL2, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(side="left")
+        grouped = {}
+        for l in lots:
+            key = (l.get("location") or "", float(l.get("quantity") or 0), l.get("uom") or "", (l.get("tracking_type") or "NONE"), l.get("code") or "")
+            grouped[key] = grouped.get(key, 0) + 1
+        for (loc, qty, uom, trk, code), _ in grouped.items():
+            row = tk.Frame(box, bg=PANEL2)
+            row.pack(fill="x", pady=1)
+            vals = (loc, f"{qty:g}", uom, trk, code)
+            widths = (24, 12, 16, 8, 20)
+            for v, w in zip(vals, widths):
+                fg = "#6FD6FA" if _norm(loc) in (_norm("Virtual Location"), _norm(SCRAP_LOCATION)) else TXT
+                tk.Label(row, text=v, width=w, anchor="w", bg=PANEL2, fg=fg, font=("Segoe UI", 10)).pack(side="left")
 
     # -- save
     def save(self):
@@ -1523,7 +2173,7 @@ class ProductCard(tk.Frame):
             uom = v["uom"]
             match = next((u for u in self.uoms if _norm(u) == _norm(uom)), None)
             uom = match or re.sub(r"\s+", " ", uom)  # reuse the existing spelling if it's a duplicate
-            lots = make_lots(qty, uom, v["gen_n"]) if self.gen.get() else []
+            lots = self.parse_allocations(qty, uom) if qty is not None else []
             min_q = None
             if self.low.get():
                 try:
@@ -1553,7 +2203,8 @@ class ProductCard(tk.Frame):
             return
         self.app.refresh_activity()
         self.app.show_find()
-        messagebox.showinfo("Saved", f"Item {n} created." + (f"\nLot codes: {', '.join(c for c, _ in lots)}" if lots else ""))
+        codes = [l["code"] for l in lots if l.get("code")]
+        messagebox.showinfo("Saved", f"Item {n} created." + (f"\nTracking codes: {', '.join(codes)}" if codes else ""))
 
 
 if __name__ == "__main__":
